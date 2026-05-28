@@ -1,963 +1,626 @@
 """
 ks33500b/gui.py
 
-Standalone PyQt5 GUI for the Keysight 33500B series waveform generator.
+NiceGUI control panel for the Keysight 33500B series waveform generator
+(33511B / 33512B / 33521B / 33522B and the A variants).
 
-Launch directly:
-    python -m ks33500b.gui
+Mirrors the Rigol DG1022 panel ([../rigoldg1022-python/dg1022/gui.py]) in
+look and tab structure, but uses the 33500B-native parameter set:
 
-Tabs:
-    Connection  — VISA string, scan, mode, connect/disconnect, *IDN?
-    Channel 1   — function, freq, amp, offset, phase, load, output on/off
-    Channel 2   — same as Channel 1, for CH2
-    Burst       — N-cycle / gated burst (per channel)
-    Sweep       — frequency sweep (per channel) with frequency-vs-time preview
-    Arbitrary   — generate / load / upload arbitrary waveforms
+  - Pulse: period, width (s), rise/fall edges — not the Rigol's
+    duty-cycle.
+  - Square: explicit duty-cycle override after APPLy.
+  - Ramp:   explicit symmetry override after APPLy.
+
+Each channel card has a live waveform preview — a small matplotlib plot
+that regenerates from the on-screen parameters every time the user touches
+a field, so the operator sees the *shape* they're about to send before
+clicking "apply".  Pure-Python preview; no instrument round-trip.
+
+Standalone-or-embedded pattern is the same as the other instrument GUIs:
+
+  - Standalone (`python -m ks33500b.gui`): a connection card creates and
+    owns its own KS33500BController.
+  - Embedded (`build_page(get_controller=..., show_connection=False)`):
+    a parent app (the DAQ web shell) passes a getter for a shared
+    controller.
+
+Tabs: connection (standalone only), ch1, ch2, burst, sweep, arbitrary.
 """
 
-import sys
+from __future__ import annotations
+
+import asyncio
 import time
+from typing import Callable, Optional
+
 import numpy as np
-
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QSpinBox,
-    QDoubleSpinBox, QTextEdit, QTabWidget, QGridLayout, QFileDialog,
-    QRadioButton, QButtonGroup,
-)
-from PyQt5.QtCore import QThread, pyqtSignal, QObject
-from PyQt5.QtGui import QFont
-
-try:
-    import matplotlib
-    matplotlib.use("Qt5Agg")
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
+from nicegui import ui
 
 from .controller import KS33500BController
-from .driver import DEFAULT_VISA, FUNCTIONS, ARB_MAX_POINTS, ARB_MIN_POINTS
-from .arbitrary import WaveformGenerator, compute_optimal_points
+from .driver     import DEFAULT_VISA
 
 
 # ---------------------------------------------------------------------------
-# Worker signals
+# Style — xsphere/DAQ palette (matches the Rigol DG1022 panel)
 # ---------------------------------------------------------------------------
 
-class _Signals(QObject):
-    status    = pyqtSignal(str)
-    connected = pyqtSignal(bool, str)
-    op_done   = pyqtSignal(str)
-    scan_done = pyqtSignal(list)
+_CSS = """
+:root {
+  --bg:#11151c; --panel:#1b2230; --panel2:#232c3d;
+  --fg:#dde3ee; --mut:#8a93a6;
+  --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff;
+  --line:#2d3648;
+}
+html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
+  font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:0; }
+.pill { padding:.15rem .55rem; border-radius:999px; font-size:.78rem;
+  font-weight:600; white-space:nowrap; display:inline-flex; align-items:center; gap:.3rem; }
+.pill.ok   { background:rgba(63,185,80,.18);  color:var(--ok); }
+.pill.bad  { background:rgba(248,81,73,.18);  color:var(--bad); }
+.pill.warn { background:rgba(210,153,34,.18); color:var(--warn); }
+.pill.mut  { background:rgba(138,147,166,.15);color:var(--mut); }
+.q-card, .ks-card {
+  background:var(--panel) !important; color:var(--fg) !important;
+  border:1px solid var(--line); border-radius:10px;
+  box-shadow:none !important; padding:.55rem .85rem .7rem !important;
+}
+.ks-card h2 { font-size:.92rem; margin:.05rem 0 .45rem; color:var(--acc);
+  font-weight:600; letter-spacing:.3px; }
+.q-btn { background:var(--panel2) !important; color:var(--fg) !important;
+  border:1px solid var(--line) !important; border-radius:6px !important;
+  box-shadow:none !important; padding:.18rem .65rem !important;
+  min-height:32px !important; text-transform:none !important; }
+.q-btn:hover { border-color:var(--acc) !important; }
+.q-btn[data-q-color="primary"], .q-btn.bg-primary {
+  background:var(--acc) !important; color:#08111f !important;
+  border-color:var(--acc) !important; font-weight:600 !important; }
+.q-btn[data-q-color="negative"], .q-btn.bg-negative {
+  background:transparent !important; color:var(--bad) !important;
+  border-color:var(--bad) !important; }
+.q-field__control, .q-field--filled .q-field__control {
+  background:var(--panel2) !important; border:1px solid var(--line) !important;
+  border-radius:6px !important; min-height:32px !important; color:var(--fg) !important; }
+.q-field__label, .q-field__native, .q-field input { color:var(--fg) !important; }
+.q-field__label { color:var(--mut) !important; }
+.q-field--filled .q-field__control:before,
+.q-field--filled .q-field__control:after { display:none !important; }
+.q-tab { color:var(--mut) !important; text-transform:none !important; }
+.q-tab--active { color:var(--acc) !important; }
+.q-tab__indicator { background:var(--acc) !important; }
+.q-log, .nicegui-log { background:var(--panel2) !important; color:var(--fg) !important;
+  border:1px solid var(--line); border-radius:6px;
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.82rem; }
+.num { font-variant-numeric:tabular-nums; }
+"""
 
 
-class _ConnectWorker(QThread):
-    def __init__(self, ctrl, signals):
-        super().__init__()
-        self._ctrl = ctrl; self._signals = signals
-
-    def run(self):
-        try:
-            self._ctrl.connect()
-            self._signals.connected.emit(True, self._ctrl.identify())
-        except Exception as e:
-            self._signals.connected.emit(False, str(e))
-
-
-class _CallWorker(QThread):
-    """Run a single (fn, args, kwargs) on the controller off the GUI thread."""
-
-    def __init__(self, fn, args, kwargs, signals, label):
-        super().__init__()
-        self._fn = fn; self._args = args; self._kwargs = kwargs
-        self._signals = signals; self._label = label
-
-    def run(self):
-        try:
-            self._fn(*self._args, **self._kwargs)
-            self._signals.op_done.emit(self._label)
-        except Exception as e:
-            self._signals.status.emit(f"{self._label} error: {e}")
-
-
-class _ScanWorker(QThread):
-    def __init__(self, signals):
-        super().__init__()
-        self._signals = signals
-
-    def run(self):
-        try:
-            devices = KS33500BController.discover(filter_keysight=True)
-        except Exception:
-            devices = []
-        self._signals.scan_done.emit(devices)
-
-
-# ---------------------------------------------------------------------------
-# Reusable channel control panel
-# ---------------------------------------------------------------------------
-
-class _ChannelPanel(QWidget):
-    """Function/frequency/amplitude/offset/phase/output controls for one channel."""
-
-    def __init__(self, channel: int, get_ctrl, signals, log_fn, parent=None):
-        super().__init__(parent)
-        self._channel  = channel
-        self._get_ctrl = get_ctrl
-        self._signals  = signals
-        self._log_fn   = log_fn
-        self._worker   = None
-        self._build()
-
-    def _build(self):
-        lay = QVBoxLayout(self)
-
-        wbox = QGroupBox(f"CH{self._channel} Waveform")
-        wg   = QGridLayout(wbox)
-
-        wg.addWidget(QLabel("Function:"), 0, 0)
-        self._fn_combo = QComboBox()
-        self._fn_combo.addItems(["SIN", "SQU", "RAMP", "PULS", "NOIS", "DC", "ARB"])
-        wg.addWidget(self._fn_combo, 0, 1)
-
-        wg.addWidget(QLabel("Frequency (Hz):"), 1, 0)
-        self._freq = QDoubleSpinBox()
-        self._freq.setRange(1e-6, 30e6); self._freq.setDecimals(6)
-        self._freq.setValue(1000.0)
-        wg.addWidget(self._freq, 1, 1)
-
-        wg.addWidget(QLabel("Amplitude (Vpp):"), 2, 0)
-        self._amp = QDoubleSpinBox()
-        self._amp.setRange(0.001, 20.0); self._amp.setDecimals(4)
-        self._amp.setValue(0.1)
-        wg.addWidget(self._amp, 2, 1)
-
-        wg.addWidget(QLabel("Offset (V):"), 3, 0)
-        self._offs = QDoubleSpinBox()
-        self._offs.setRange(-10.0, 10.0); self._offs.setDecimals(4)
-        self._offs.setValue(0.0)
-        wg.addWidget(self._offs, 3, 1)
-
-        wg.addWidget(QLabel("Phase (deg):"), 4, 0)
-        self._phase = QDoubleSpinBox()
-        self._phase.setRange(-360.0, 360.0); self._phase.setDecimals(2)
-        self._phase.setValue(0.0)
-        wg.addWidget(self._phase, 4, 1)
-
-        wg.addWidget(QLabel("Output load:"), 5, 0)
-        self._load_combo = QComboBox()
-        self._load_combo.addItems(["50", "INF (High-Z)"])
-        wg.addWidget(self._load_combo, 5, 1)
-
-        lay.addWidget(wbox)
-
-        # Pulse / square / ramp shape parameters
-        pbox = QGroupBox(f"CH{self._channel} Shape Parameters")
-        pg   = QGridLayout(pbox)
-
-        pg.addWidget(QLabel("Square duty cycle (%):"), 0, 0)
-        self._sq_dc = QDoubleSpinBox()
-        self._sq_dc.setRange(0.01, 99.99); self._sq_dc.setDecimals(2)
-        self._sq_dc.setValue(50.0)
-        pg.addWidget(self._sq_dc, 0, 1)
-
-        pg.addWidget(QLabel("Ramp symmetry (%):"), 1, 0)
-        self._ramp_sym = QDoubleSpinBox()
-        self._ramp_sym.setRange(0.0, 100.0); self._ramp_sym.setDecimals(2)
-        self._ramp_sym.setValue(100.0)
-        pg.addWidget(self._ramp_sym, 1, 1)
-
-        pg.addWidget(QLabel("Pulse period (s):"), 2, 0)
-        self._pper = QDoubleSpinBox()
-        self._pper.setRange(1e-9, 1000.0); self._pper.setDecimals(9)
-        self._pper.setValue(1e-3)
-        pg.addWidget(self._pper, 2, 1)
-
-        pg.addWidget(QLabel("Pulse width (s):"), 3, 0)
-        self._pwid = QDoubleSpinBox()
-        self._pwid.setRange(1e-9, 1000.0); self._pwid.setDecimals(9)
-        self._pwid.setValue(5e-4)
-        pg.addWidget(self._pwid, 3, 1)
-
-        lay.addWidget(pbox)
-
-        btn_row = QHBoxLayout()
-        self._apply_btn = QPushButton("Apply Settings")
-        self._on_btn    = QPushButton("Output ON")
-        self._off_btn   = QPushButton("Output OFF")
-        for b in (self._apply_btn, self._on_btn, self._off_btn):
-            b.setEnabled(False)
-            btn_row.addWidget(b)
-        lay.addLayout(btn_row)
-
-        self._status = QLabel(f"CH{self._channel} Output: OFF")
-        self._status.setStyleSheet("color: red;")
-        lay.addWidget(self._status)
-        lay.addStretch()
-
-        self._apply_btn.clicked.connect(self._on_apply)
-        self._on_btn.clicked.connect(self._on_output_on)
-        self._off_btn.clicked.connect(self._on_output_off)
-
-    # --- API ---
-
-    def set_enabled(self, enabled: bool):
-        for b in (self._apply_btn, self._on_btn, self._off_btn):
-            b.setEnabled(enabled)
-        if not enabled:
-            self._status.setText(f"CH{self._channel} Output: OFF")
-            self._status.setStyleSheet("color: red;")
-
-    # --- Slots ---
-
-    def _do(self, fn, args=(), kwargs=None, label: str = ""):
-        if kwargs is None:
-            kwargs = {}
-        w = _CallWorker(fn, args, kwargs, self._signals, label)
-        w.start()
-        self._worker = w
-
-    def _on_apply(self):
-        ctrl = self._get_ctrl()
-        if ctrl is None: return
-        ch  = self._channel
-        fn  = self._fn_combo.currentText()
-        f   = self._freq.value()
-        a   = self._amp.value()
-        o   = self._offs.value()
-        ph  = self._phase.value()
-        load = self._load_combo.currentText()
-        load_arg: float | str = "INF" if load.startswith("INF") else 50.0
-        sq_dc   = self._sq_dc.value()
-        ramp_sym = self._ramp_sym.value()
-        pper = self._pper.value()
-        pwid = self._pwid.value()
-
-        def _go():
-            ctrl.set_load(load_arg, channel=ch)
-            if fn == "SIN":
-                ctrl.apply_sine(f, a, o, ph, channel=ch)
-            elif fn == "SQU":
-                ctrl.apply_square(f, a, o, ph, duty_cycle=sq_dc, channel=ch)
-            elif fn == "RAMP":
-                ctrl.apply_ramp(f, a, o, ph, symmetry=ramp_sym, channel=ch)
-            elif fn == "PULS":
-                ctrl.apply_pulse(f, a, o, ph, channel=ch)
-                ctrl.configure_pulse(period_s=pper, width_s=pwid, channel=ch)
-            elif fn == "NOIS":
-                ctrl.apply_noise(a, o, channel=ch)
-            elif fn == "DC":
-                ctrl.apply_dc(o, channel=ch)
-            elif fn == "ARB":
-                ctrl.apply_arbitrary(f, a, o, channel=ch)
-
-        self._do(_go, label=f"CH{ch} apply")
-
-    def _on_output_on(self):
-        ctrl = self._get_ctrl()
-        if ctrl is None: return
-        ch = self._channel
-        self._do(lambda: ctrl.output_on(ch), label=f"CH{ch} output ON")
-        self._status.setText(f"CH{ch} Output: ON")
-        self._status.setStyleSheet("color: green;")
-
-    def _on_output_off(self):
-        ctrl = self._get_ctrl()
-        if ctrl is None: return
-        ch = self._channel
-        self._do(lambda: ctrl.output_off(ch), label=f"CH{ch} output OFF")
-        self._status.setText(f"CH{ch} Output: OFF")
-        self._status.setStyleSheet("color: red;")
+async def _in_thread(fn, *a, **kw):
+    return await asyncio.to_thread(fn, *a, **kw)
 
 
 # ---------------------------------------------------------------------------
-# Main window
+# Waveform preview — pure-Python shape generator
 # ---------------------------------------------------------------------------
 
-class KS33500BWindow(QMainWindow):
+def generate_preview(fn: str,
+                      freq:        float,
+                      amplitude:   float,
+                      offset:      float,
+                      *,
+                      duty_cycle:  float = 50.0,    # square wave, %
+                      symmetry:    float = 100.0,   # ramp, %
+                      period_s:    Optional[float] = None,
+                      width_s:     Optional[float] = None,
+                      n_periods:   int = 3,
+                      n_samples:   int = 1500,
+                      ) -> tuple[np.ndarray, np.ndarray]:
+    """Generate (t, v) samples for a quick on-screen preview of the
+    selected waveform.  Independent of the instrument; uses the same
+    Vpp / offset / shape parameters the operator has on screen.
+    Returns time in seconds and voltage in volts.
+    """
+    if fn == "DC":
+        t = np.linspace(0.0, 1.0, 100)
+        return t, np.full_like(t, offset)
+    f = max(freq, 1e-9)
+    if fn == "PULS" and period_s and period_s > 0:
+        total_T = n_periods * period_s
+    else:
+        total_T = n_periods / f
+    t = np.linspace(0.0, total_T, n_samples)
+    A_half = amplitude / 2.0
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Keysight 33500B AWG Control")
-        self.resize(960, 760)
-
-        self._ctrl:    KS33500BController | None = None
-        self._signals = _Signals()
-        self._worker  = None
-
-        self._build_ui()
-        self._connect_signals()
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        lay = QVBoxLayout(central)
-
-        tabs = QTabWidget()
-        tabs.addTab(self._build_connection_tab(), "Connection")
-        self._ch1_panel = _ChannelPanel(1, lambda: self._ctrl, self._signals, self._log_msg)
-        self._ch2_panel = _ChannelPanel(2, lambda: self._ctrl, self._signals, self._log_msg)
-        tabs.addTab(self._ch1_panel, "Channel 1")
-        tabs.addTab(self._ch2_panel, "Channel 2")
-        tabs.addTab(self._build_burst_tab(),  "Burst")
-        tabs.addTab(self._build_sweep_tab(),  "Sweep")
-        tabs.addTab(self._build_arb_tab(),    "Arbitrary")
-
-        lay.addWidget(tabs)
-        lay.addWidget(self._build_log())
-
-    def _build_connection_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-        box = QGroupBox("Instrument Connection")
-        g   = QGridLayout(box)
-
-        # Scan / manual mode
-        self._mode_scan = QRadioButton("Scan for devices")
-        self._mode_man  = QRadioButton("Manual VISA address")
-        self._mode_scan.setChecked(True)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self._mode_scan)
-        self._mode_group.addButton(self._mode_man)
-        g.addWidget(self._mode_scan, 0, 0)
-        g.addWidget(self._mode_man,  0, 1)
-
-        g.addWidget(QLabel("Device:"), 1, 0)
-        self._device_combo = QComboBox()
-        self._device_combo.setEditable(False)
-        self._device_combo.setMinimumWidth(420)
-        g.addWidget(self._device_combo, 1, 1)
-        self._scan_btn = QPushButton("Scan")
-        g.addWidget(self._scan_btn, 1, 2)
-
-        g.addWidget(QLabel("VISA Resource:"), 2, 0)
-        self._visa_edit = QLineEdit(DEFAULT_VISA)
-        g.addWidget(self._visa_edit, 2, 1, 1, 2)
-
-        g.addWidget(QLabel("Mode:"), 3, 0)
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["simulation", "hardware"])
-        g.addWidget(self._mode_combo, 3, 1)
-
-        btn_row = QHBoxLayout()
-        self._connect_btn    = QPushButton("Connect")
-        self._disconnect_btn = QPushButton("Disconnect")
-        self._test_btn       = QPushButton("Test")
-        self._reset_btn      = QPushButton("*RST")
-        self._beep_btn       = QPushButton("Beep")
-        self._disconnect_btn.setEnabled(False)
-        self._reset_btn.setEnabled(False)
-        self._beep_btn.setEnabled(False)
-        btn_row.addWidget(self._connect_btn)
-        btn_row.addWidget(self._disconnect_btn)
-        btn_row.addWidget(self._test_btn)
-        btn_row.addWidget(self._reset_btn)
-        btn_row.addWidget(self._beep_btn)
-        g.addLayout(btn_row, 4, 0, 1, 3)
-
-        self._conn_label = QLabel("Not connected")
-        self._conn_label.setStyleSheet("color: red; font-weight: bold;")
-        g.addWidget(self._conn_label, 5, 0, 1, 3)
-
-        lay.addWidget(box)
-        lay.addStretch()
-
-        self._scan_btn.clicked.connect(self._on_scan)
-        self._mode_scan.toggled.connect(self._on_mode_changed)
-        self._device_combo.currentIndexChanged.connect(self._on_device_picked)
-        return w
-
-    def _build_burst_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-        box = QGroupBox("Burst Mode")
-        g   = QGridLayout(box)
-
-        g.addWidget(QLabel("Channel:"), 0, 0)
-        self._burst_ch = QComboBox(); self._burst_ch.addItems(["1", "2"])
-        g.addWidget(self._burst_ch, 0, 1)
-
-        g.addWidget(QLabel("Mode:"), 1, 0)
-        self._burst_mode = QComboBox()
-        self._burst_mode.addItems(["TRIG", "GAT"])
-        g.addWidget(self._burst_mode, 1, 1)
-
-        g.addWidget(QLabel("N cycles:"), 2, 0)
-        self._burst_n = QSpinBox()
-        self._burst_n.setRange(1, 1_000_000); self._burst_n.setValue(1)
-        g.addWidget(self._burst_n, 2, 1)
-
-        g.addWidget(QLabel("Initial phase (deg):"), 3, 0)
-        self._burst_ph = QDoubleSpinBox()
-        self._burst_ph.setRange(-360.0, 360.0); self._burst_ph.setValue(0.0)
-        g.addWidget(self._burst_ph, 3, 1)
-
-        g.addWidget(QLabel("Trigger source:"), 4, 0)
-        self._burst_trig = QComboBox()
-        self._burst_trig.addItems(["IMM", "EXT", "TIM", "BUS"])
-        g.addWidget(self._burst_trig, 4, 1)
-
-        btn_row = QHBoxLayout()
-        self._burst_apply = QPushButton("Enable Burst")
-        self._burst_off   = QPushButton("Disable Burst")
-        self._burst_trgbtn = QPushButton("Trigger Now")
-        self._burst_busbtn = QPushButton("*TRG (BUS)")
-        for b in (self._burst_apply, self._burst_off,
-                  self._burst_trgbtn, self._burst_busbtn):
-            b.setEnabled(False)
-            btn_row.addWidget(b)
-        g.addLayout(btn_row, 5, 0, 1, 2)
-        lay.addWidget(box)
-        lay.addStretch()
-
-        self._burst_apply.clicked.connect(self._on_burst_apply)
-        self._burst_off.clicked.connect(self._on_burst_off)
-        self._burst_trgbtn.clicked.connect(self._on_burst_trigger)
-        self._burst_busbtn.clicked.connect(self._on_burst_bustrigger)
-        return w
-
-    def _build_sweep_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-        box = QGroupBox("Frequency Sweep")
-        g   = QGridLayout(box)
-
-        g.addWidget(QLabel("Channel:"), 0, 0)
-        self._sw_ch = QComboBox(); self._sw_ch.addItems(["1", "2"])
-        g.addWidget(self._sw_ch, 0, 1)
-
-        g.addWidget(QLabel("Start (Hz):"), 1, 0)
-        self._sw_start = QDoubleSpinBox()
-        self._sw_start.setRange(1e-6, 30e6); self._sw_start.setDecimals(3)
-        self._sw_start.setValue(100e3)
-        g.addWidget(self._sw_start, 1, 1)
-
-        g.addWidget(QLabel("Stop (Hz):"), 2, 0)
-        self._sw_stop = QDoubleSpinBox()
-        self._sw_stop.setRange(1e-6, 30e6); self._sw_stop.setDecimals(3)
-        self._sw_stop.setValue(700e3)
-        g.addWidget(self._sw_stop, 2, 1)
-
-        g.addWidget(QLabel("Time (s):"), 3, 0)
-        self._sw_time = QDoubleSpinBox()
-        self._sw_time.setRange(1e-3, 8000.0); self._sw_time.setDecimals(4)
-        self._sw_time.setValue(0.1)
-        g.addWidget(self._sw_time, 3, 1)
-
-        g.addWidget(QLabel("Return time (s):"), 4, 0)
-        self._sw_rtime = QDoubleSpinBox()
-        self._sw_rtime.setRange(0.0, 8000.0); self._sw_rtime.setDecimals(4)
-        self._sw_rtime.setValue(0.0)
-        g.addWidget(self._sw_rtime, 4, 1)
-
-        g.addWidget(QLabel("Hold start (s):"), 5, 0)
-        self._sw_hstart = QDoubleSpinBox()
-        self._sw_hstart.setRange(0.0, 8000.0); self._sw_hstart.setDecimals(4)
-        g.addWidget(self._sw_hstart, 5, 1)
-
-        g.addWidget(QLabel("Hold stop (s):"), 6, 0)
-        self._sw_hstop = QDoubleSpinBox()
-        self._sw_hstop.setRange(0.0, 8000.0); self._sw_hstop.setDecimals(4)
-        g.addWidget(self._sw_hstop, 6, 1)
-
-        g.addWidget(QLabel("Spacing:"), 7, 0)
-        self._sw_spc = QComboBox(); self._sw_spc.addItems(["LIN", "LOG"])
-        g.addWidget(self._sw_spc, 7, 1)
-
-        g.addWidget(QLabel("Trigger source:"), 8, 0)
-        self._sw_trig = QComboBox()
-        self._sw_trig.addItems(["IMM", "EXT", "TIM", "BUS"])
-        g.addWidget(self._sw_trig, 8, 1)
-
-        btn_row = QHBoxLayout()
-        self._sw_apply   = QPushButton("Enable Sweep")
-        self._sw_off     = QPushButton("Disable Sweep")
-        self._sw_preview = QPushButton("Preview")
-        for b in (self._sw_apply, self._sw_off, self._sw_preview):
-            b.setEnabled(False)
-            btn_row.addWidget(b)
-        self._sw_preview.setEnabled(True)   # preview is offline
-        g.addLayout(btn_row, 9, 0, 1, 2)
-        lay.addWidget(box)
-
-        if HAS_MPL:
-            self._sw_fig    = Figure(figsize=(7, 2.5))
-            self._sw_canvas = FigureCanvas(self._sw_fig)
-            self._sw_ax     = self._sw_fig.add_subplot(111)
-            self._sw_ax.set_xlabel("Time (s)")
-            self._sw_ax.set_ylabel("Frequency (Hz)")
-            self._sw_ax.set_title("Sweep preview")
-            self._sw_ax.grid(True, alpha=0.3)
-            lay.addWidget(self._sw_canvas)
-
-        lay.addStretch()
-
-        self._sw_apply.clicked.connect(self._on_sweep_apply)
-        self._sw_off.clicked.connect(self._on_sweep_off)
-        self._sw_preview.clicked.connect(self._on_sweep_preview)
-        return w
-
-    def _build_arb_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-        box = QGroupBox("Arbitrary Waveform")
-        g   = QGridLayout(box)
-
-        g.addWidget(QLabel("Generator:"), 0, 0)
-        self._arb_kind = QComboBox()
-        self._arb_kind.addItems([
-            "Sine", "Square", "Triangle", "Pulse",
-            "Gaussian", "Sinc", "Exponential decay",
-            "Frequency comb",
-        ])
-        g.addWidget(self._arb_kind, 0, 1)
-
-        g.addWidget(QLabel("Name (≤12 chars):"), 1, 0)
-        self._arb_name = QLineEdit("ARB1")
-        self._arb_name.setMaxLength(12)
-        g.addWidget(self._arb_name, 1, 1)
-
-        g.addWidget(QLabel("Output frequency (Hz):"), 2, 0)
-        self._arb_freq = QDoubleSpinBox()
-        self._arb_freq.setRange(1e-6, 30e6); self._arb_freq.setDecimals(3)
-        self._arb_freq.setValue(1000.0)
-        g.addWidget(self._arb_freq, 2, 1)
-
-        g.addWidget(QLabel("Comb frequencies (CSV Hz, comb only):"), 3, 0)
-        self._arb_comb = QLineEdit("100, 200, 300, 400, 500")
-        g.addWidget(self._arb_comb, 3, 1)
-
-        g.addWidget(QLabel("Apply to channel:"), 4, 0)
-        self._arb_ch = QComboBox(); self._arb_ch.addItems(["1", "2"])
-        g.addWidget(self._arb_ch, 4, 1)
-
-        btn_row = QHBoxLayout()
-        self._arb_gen_btn   = QPushButton("Generate + Upload")
-        self._arb_file_btn  = QPushButton("Load from .csv/.npy")
-        self._arb_play_btn  = QPushButton("Apply ARB (current)")
-        for b in (self._arb_gen_btn, self._arb_file_btn, self._arb_play_btn):
-            b.setEnabled(False)
-            btn_row.addWidget(b)
-        g.addLayout(btn_row, 5, 0, 1, 2)
-        lay.addWidget(box)
-
-        if HAS_MPL:
-            self._arb_fig    = Figure(figsize=(7, 2.5))
-            self._arb_canvas = FigureCanvas(self._arb_fig)
-            self._arb_ax     = self._arb_fig.add_subplot(111)
-            self._arb_ax.set_xlabel("Sample"); self._arb_ax.set_ylabel("Amplitude")
-            self._arb_ax.set_title("Arbitrary waveform preview")
-            self._arb_ax.grid(True, alpha=0.3)
-            lay.addWidget(self._arb_canvas)
-
-        self._arb_gen_btn.clicked.connect(self._on_arb_generate)
-        self._arb_file_btn.clicked.connect(self._on_arb_file)
-        self._arb_play_btn.clicked.connect(self._on_arb_play)
-
-        return w
-
-    def _build_log(self) -> QWidget:
-        box = QGroupBox("Status Log")
-        lay = QVBoxLayout(box)
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setMaximumHeight(140)
-        self._log.setFont(QFont("Courier", 9))
-        lay.addWidget(self._log)
-        return box
-
-    # ------------------------------------------------------------------
-    # Signal wiring
-    # ------------------------------------------------------------------
-
-    def _connect_signals(self):
-        self._connect_btn.clicked.connect(self._on_connect)
-        self._disconnect_btn.clicked.connect(self._on_disconnect)
-        self._test_btn.clicked.connect(self._on_test)
-        self._reset_btn.clicked.connect(self._on_reset)
-        self._beep_btn.clicked.connect(self._on_beep)
-        self._signals.connected.connect(self._on_connect_result)
-        self._signals.status.connect(self._log_msg)
-        self._signals.op_done.connect(lambda label: self._log_msg(f"OK: {label}"))
-        self._signals.scan_done.connect(self._on_scan_result)
-
-    # ------------------------------------------------------------------
-    # Connection slots
-    # ------------------------------------------------------------------
-
-    def _set_action_buttons_enabled(self, enabled: bool):
-        self._ch1_panel.set_enabled(enabled)
-        self._ch2_panel.set_enabled(enabled)
-        for b in (self._burst_apply, self._burst_off,
-                  self._burst_trgbtn, self._burst_busbtn,
-                  self._sw_apply, self._sw_off,
-                  self._arb_gen_btn, self._arb_file_btn, self._arb_play_btn,
-                  self._reset_btn, self._beep_btn):
-            b.setEnabled(enabled)
-
-    def _on_mode_changed(self):
-        scan = self._mode_scan.isChecked()
-        self._device_combo.setEnabled(scan)
-        self._scan_btn.setEnabled(scan)
-        self._visa_edit.setEnabled(not scan)
-
-    def _on_scan(self):
-        if self._mode_combo.currentText() == "simulation":
-            self._log_msg("Scan skipped (simulation mode).")
-            return
-        self._scan_btn.setEnabled(False)
-        self._log_msg("Scanning VISA bus for Keysight 33500B...")
-        w = _ScanWorker(self._signals)
-        w.start(); self._worker = w
-
-    def _on_scan_result(self, devices: list):
-        self._scan_btn.setEnabled(True)
-        self._device_combo.clear()
-        if not devices:
-            self._log_msg("No 33500B devices found.")
-            return
-        for res, idn in devices:
-            self._device_combo.addItem(f"{idn}  [{res}]", userData=res)
-        self._log_msg(f"Found {len(devices)} device(s).")
-        # Auto-pick the first
-        if self._device_combo.count() > 0:
-            self._device_combo.setCurrentIndex(0)
-
-    def _on_device_picked(self, idx: int):
-        if idx < 0:
-            return
-        res = self._device_combo.itemData(idx)
-        if res:
-            self._visa_edit.setText(res)
-
-    def _on_connect(self):
-        if self._mode_scan.isChecked():
-            idx = self._device_combo.currentIndex()
-            if idx >= 0:
-                self._visa_edit.setText(self._device_combo.itemData(idx) or self._visa_edit.text())
-        self._ctrl = KS33500BController(
-            visa=self._visa_edit.text().strip(),
-            mode=self._mode_combo.currentText(),
+    if fn == "SIN":
+        v = A_half * np.sin(2 * np.pi * f * t)
+    elif fn == "SQU":
+        duty = max(0.001, min(0.999, duty_cycle / 100.0))
+        phase = (t * f) % 1.0
+        v = np.where(phase < duty, A_half, -A_half)
+    elif fn == "RAMP":
+        sym = max(0.001, min(0.999, symmetry / 100.0))
+        phase = (t * f) % 1.0
+        v = np.where(
+            phase < sym,
+            A_half * (2.0 * phase / sym - 1.0),
+            A_half * (1.0 - 2.0 * (phase - sym) / (1.0 - sym)),
         )
-        self._log_msg("Connecting...")
-        self._connect_btn.setEnabled(False)
-        w = _ConnectWorker(self._ctrl, self._signals)
-        w.start(); self._worker = w
+    elif fn == "PULS":
+        period = period_s if (period_s and period_s > 0) else (1.0 / f)
+        width = width_s if (width_s and 0 < width_s < period) else (period * 0.5)
+        phase = t % period
+        v = np.where(phase < width, A_half, -A_half)
+    elif fn == "NOIS":
+        rng = np.random.default_rng(42)
+        v = rng.normal(0.0, A_half / 3.0, len(t))
+    else:   # "ARB" or anything else — placeholder shape
+        v = A_half * np.sin(2 * np.pi * f * t) ** 3
+    return t, v + offset
 
-    def _on_connect_result(self, ok: bool, msg: str):
-        self._connect_btn.setEnabled(True)
-        if ok:
-            self._conn_label.setText(f"Connected: {msg}")
-            self._conn_label.setStyleSheet("color: green; font-weight: bold;")
-            self._disconnect_btn.setEnabled(True)
-            self._set_action_buttons_enabled(True)
-            self._log_msg(f"Connected: {msg}")
-        else:
-            self._conn_label.setText("Failed")
-            self._conn_label.setStyleSheet("color: red; font-weight: bold;")
-            self._ctrl = None
-            self._log_msg(f"FAILED: {msg}")
 
-    def _on_disconnect(self):
-        if self._ctrl:
+def _style_dark(fig, ax) -> None:
+    fig.patch.set_facecolor("#1b2230")
+    ax.set_facecolor("#11151c")
+    for sp in ax.spines.values():
+        sp.set_color("#2d3648")
+    ax.tick_params(colors="#8a93a6", labelsize=8)
+    ax.grid(True, color="#2d3648", alpha=.4)
+
+
+def _x_units(T_s: float) -> tuple[float, str]:
+    """Return a multiplier and label that scales T_s into a readable unit."""
+    if T_s < 1e-5:  return 1e9, "ns"
+    if T_s < 1e-2:  return 1e6, "µs"
+    if T_s < 1.0:   return 1e3, "ms"
+    return 1.0, "s"
+
+
+# ---------------------------------------------------------------------------
+# Per-channel control card
+# ---------------------------------------------------------------------------
+
+def _channel_card(ch: int, get_ctrl, log_msg) -> None:
+    with ui.card().classes("ks-card w-full"):
+        ui.html(f"<h2>ch{ch} waveform</h2>")
+
+        with ui.row().classes("w-full no-wrap gap-3 items-start"):
+            # ----- Left column: parameters -----
+            with ui.column().classes("gap-1"):
+                fn_sel = ui.select(
+                    ["SIN", "SQU", "RAMP", "PULS", "NOIS", "DC", "ARB"],
+                    value="SIN", label="function",
+                ).classes("w-40")
+                freq = ui.number(label="frequency (Hz)", value=1000.0,
+                                  step=1.0, format="%.6f").classes("w-44 num")
+                amp  = ui.number(label="amplitude (Vpp)", value=1.0,
+                                  step=0.1, format="%.4f").classes("w-44 num")
+                offs = ui.number(label="offset (V)", value=0.0,
+                                  step=0.1, format="%.4f").classes("w-44 num")
+                phase= ui.number(label="phase (deg)", value=0.0,
+                                  step=1.0, format="%.2f").classes("w-44 num")
+                load = ui.select(["50", "INF (High-Z)"], value="50",
+                                  label="output load").classes("w-44")
+
+                # 33500B-specific: pulse uses width (s) + edges, not duty cycle.
+                with ui.expansion("pulse parameters").classes("w-full"):
+                    pulse_per  = ui.number(label="period (s)",  value=1e-3,
+                                            step=1e-6, format="%.9f").classes("w-44 num")
+                    pulse_wid  = ui.number(label="width (s)",   value=5e-4,
+                                            step=1e-6, format="%.9f").classes("w-44 num")
+                    pulse_rise = ui.number(label="rise time (s)", value=1e-8,
+                                            step=1e-9, format="%.9f").classes("w-44 num")
+                    pulse_fall = ui.number(label="fall time (s)", value=1e-8,
+                                            step=1e-9, format="%.9f").classes("w-44 num")
+
+                with ui.expansion("square duty cycle").classes("w-full"):
+                    sq_duty = ui.number(label="duty (%)", value=50.0,
+                                         step=1.0, min=0.01, max=99.99) \
+                        .classes("w-44 num")
+
+                with ui.expansion("ramp symmetry").classes("w-full"):
+                    rm_sym = ui.number(label="symmetry (%)", value=100.0,
+                                        step=1.0, min=0.0, max=100.0) \
+                        .classes("w-44 num")
+
+            # ----- Right column: live preview plot -----
+            with ui.column().classes("flex-1"):
+                ui.html('<div style="font-size:.7rem; letter-spacing:.4px; '
+                        'text-transform:uppercase; color:var(--mut); '
+                        'margin-bottom:.25rem">preview</div>')
+                preview = ui.matplotlib(figsize=(5.4, 2.2)).classes("w-full")
+                pv_ax = preview.figure.add_subplot(111)
+                _style_dark(preview.figure, pv_ax)
+                preview.figure.tight_layout()
+
+        out_pill = ui.html(
+            f'<span class="pill mut" style="margin-top:.4rem; display:inline-block">'
+            f'ch{ch} output: off</span>'
+        )
+
+        # ----- Refresh the preview from the current values -----
+        def _refresh_preview(*_):
+            fn = str(fn_sel.value)
             try:
-                self._ctrl.disconnect()
-            except Exception as e:
-                self._log_msg(f"Disconnect: {e}")
-            self._ctrl = None
-        self._conn_label.setText("Not connected")
-        self._conn_label.setStyleSheet("color: red; font-weight: bold;")
-        self._disconnect_btn.setEnabled(False)
-        self._set_action_buttons_enabled(False)
-        self._log_msg("Disconnected.")
-
-    def _on_test(self):
-        config = {"visa": self._visa_edit.text().strip(),
-                  "mode": self._mode_combo.currentText()}
-
-        class _T(QThread):
-            done = pyqtSignal(bool, str)
-            def run(self_):
-                ok, msg = KS33500BController.test(config)
-                self_.done.emit(ok, msg)
-        t = _T(self)
-        t.done.connect(lambda ok, m: self._log_msg(f"Test {'OK' if ok else 'FAILED'}: {m}"))
-        t.start(); self._worker = t
-
-    def _on_reset(self):
-        if self._ctrl is None: return
-        try:
-            self._ctrl.reset()
-            self._log_msg("Reset (*RST) done.")
-        except Exception as e:
-            self._log_msg(f"Reset error: {e}")
-
-    def _on_beep(self):
-        if self._ctrl is None: return
-        try:
-            self._ctrl.beep()
-            self._log_msg("Beep.")
-        except Exception as e:
-            self._log_msg(f"Beep error: {e}")
-
-    # ------------------------------------------------------------------
-    # Burst slots
-    # ------------------------------------------------------------------
-
-    def _on_burst_apply(self):
-        if self._ctrl is None: return
-        ch = int(self._burst_ch.currentText())
-        kwargs = dict(
-            ncycles  = self._burst_n.value(),
-            mode     = self._burst_mode.currentText(),
-            phase_deg= self._burst_ph.value(),
-            trigger  = self._burst_trig.currentText(),
-            channel  = ch,
-        )
-        w = _CallWorker(self._ctrl.enable_burst, (), kwargs,
-                        self._signals, f"CH{ch} burst enable")
-        w.start(); self._worker = w
-
-    def _on_burst_off(self):
-        if self._ctrl is None: return
-        ch = int(self._burst_ch.currentText())
-        w = _CallWorker(self._ctrl.disable_burst, (ch,), {},
-                        self._signals, f"CH{ch} burst disable")
-        w.start(); self._worker = w
-
-    def _on_burst_trigger(self):
-        if self._ctrl is None: return
-        ch = int(self._burst_ch.currentText())
-        try:
-            self._ctrl.trigger(channel=ch)
-            self._log_msg(f"CH{ch} TRIG:IMM sent.")
-        except Exception as e:
-            self._log_msg(f"Trigger error: {e}")
-
-    def _on_burst_bustrigger(self):
-        if self._ctrl is None: return
-        try:
-            self._ctrl.bus_trigger()
-            self._log_msg("*TRG sent.")
-        except Exception as e:
-            self._log_msg(f"*TRG error: {e}")
-
-    # ------------------------------------------------------------------
-    # Sweep slots
-    # ------------------------------------------------------------------
-
-    def _on_sweep_apply(self):
-        if self._ctrl is None: return
-        ch = int(self._sw_ch.currentText())
-        kwargs = dict(
-            start_hz    = self._sw_start.value(),
-            stop_hz     = self._sw_stop.value(),
-            time_s      = self._sw_time.value(),
-            spacing     = self._sw_spc.currentText(),
-            return_time = self._sw_rtime.value(),
-            hold_start  = self._sw_hstart.value(),
-            hold_stop   = self._sw_hstop.value(),
-            trigger     = self._sw_trig.currentText(),
-            channel     = ch,
-        )
-        w = _CallWorker(self._ctrl.enable_sweep, (), kwargs,
-                        self._signals, f"CH{ch} sweep enable")
-        w.start(); self._worker = w
-
-    def _on_sweep_off(self):
-        if self._ctrl is None: return
-        ch = int(self._sw_ch.currentText())
-        w = _CallWorker(self._ctrl.disable_sweep, (ch,), {},
-                        self._signals, f"CH{ch} sweep disable")
-        w.start(); self._worker = w
-
-    def _on_sweep_preview(self):
-        if not HAS_MPL:
-            self._log_msg("matplotlib not available — preview disabled.")
-            return
-        start = self._sw_start.value()
-        stop  = self._sw_stop.value()
-        tsw   = max(1e-6, self._sw_time.value())
-        rtime = self._sw_rtime.value()
-        hs    = self._sw_hstart.value()
-        hp    = self._sw_hstop.value()
-        spc   = self._sw_spc.currentText()
-
-        t_segs, f_segs = [], []
-        t0 = 0.0
-        if hs > 0:
-            t_segs.append(np.array([t0, t0 + hs]))
-            f_segs.append(np.array([start, start]))
-            t0 += hs
-        n = 300
-        ts = np.linspace(t0, t0 + tsw, n)
-        frac = (ts - t0) / tsw
-        if spc.upper().startswith("LOG") and start > 0 and stop > 0:
-            fs = start * (stop / start) ** frac
-        else:
-            fs = start + (stop - start) * frac
-        t_segs.append(ts); f_segs.append(fs)
-        t0 += tsw
-        if hp > 0:
-            t_segs.append(np.array([t0, t0 + hp]))
-            f_segs.append(np.array([stop, stop]))
-            t0 += hp
-        if rtime > 0:
-            tr = np.linspace(t0, t0 + rtime, n)
-            frac_r = (tr - t0) / rtime
-            if spc.upper().startswith("LOG") and start > 0 and stop > 0:
-                fr = stop * (start / stop) ** frac_r
-            else:
-                fr = stop + (start - stop) * frac_r
-            t_segs.append(tr); f_segs.append(fr)
-
-        t_all = np.concatenate(t_segs)
-        f_all = np.concatenate(f_segs)
-
-        self._sw_ax.clear()
-        self._sw_ax.plot(t_all, f_all, color="#1f77b4", linewidth=1.5)
-        self._sw_ax.set_xlabel("Time (s)")
-        self._sw_ax.set_ylabel("Frequency (Hz)")
-        self._sw_ax.set_title("Sweep preview")
-        self._sw_ax.grid(True, alpha=0.3)
-        if spc.upper().startswith("LOG"):
-            try:
-                self._sw_ax.set_yscale("log")
+                t, v = generate_preview(
+                    fn        = fn,
+                    freq      = float(freq.value or 0.0),
+                    amplitude = float(amp.value  or 0.0),
+                    offset    = float(offs.value or 0.0),
+                    duty_cycle= float(sq_duty.value or 50.0),
+                    symmetry  = float(rm_sym.value  or 100.0),
+                    period_s  = float(pulse_per.value or 0.0) or None,
+                    width_s   = float(pulse_wid.value or 0.0) or None,
+                )
             except Exception:
-                pass
-        self._sw_fig.tight_layout()
-        self._sw_canvas.draw()
+                return
+            pv_ax.clear()
+            _style_dark(preview.figure, pv_ax)
+            mul, unit = _x_units(t[-1] if len(t) else 0.001)
+            pv_ax.plot(t * mul, v, lw=1.3, color="#58a6ff")
+            pv_ax.set_xlabel(f"time ({unit})", color="#8a93a6", fontsize=9)
+            pv_ax.set_ylabel("V", color="#8a93a6", fontsize=9)
+            preview.figure.tight_layout()
+            preview.update()
 
-    # ------------------------------------------------------------------
-    # Arbitrary slots
-    # ------------------------------------------------------------------
+        for w in (fn_sel, freq, amp, offs,
+                  sq_duty, rm_sym, pulse_per, pulse_wid):
+            w.on("update:model-value", _refresh_preview)
+        _refresh_preview()
 
-    def _on_arb_generate(self):
-        if self._ctrl is None: return
-        kind = self._arb_kind.currentText()
-        name = self._arb_name.text().strip() or "ARB1"
-        freq = self._arb_freq.value()
-        ch   = int(self._arb_ch.currentText())
+        # ----- Apply / output buttons -----
+        def _do_apply():
+            c = get_ctrl()
+            if c is None:
+                log_msg(f"ch{ch} apply: not connected"); return
+            try:
+                ld = "INF" if "INF" in str(load.value) else 50.0
+                c.set_load(ld, channel=ch)
+                fn = str(fn_sel.value)
+                f = float(freq.value)
+                a = float(amp.value)
+                o = float(offs.value)
+                p = float(phase.value)
+                if fn == "SIN":
+                    c.apply_sine(f, a, o, p, channel=ch)
+                elif fn == "SQU":
+                    c.apply_square(f, a, o, p,
+                                    duty_cycle=float(sq_duty.value), channel=ch)
+                elif fn == "RAMP":
+                    c.apply_ramp(f, a, o, p,
+                                  symmetry=float(rm_sym.value), channel=ch)
+                elif fn == "PULS":
+                    c.apply_pulse(f, a, o, p, channel=ch)
+                    c.configure_pulse(
+                        period_s   = float(pulse_per.value),
+                        width_s    = float(pulse_wid.value),
+                        rise_time_s= float(pulse_rise.value),
+                        fall_time_s= float(pulse_fall.value),
+                        channel    = ch,
+                    )
+                elif fn == "NOIS":
+                    c.apply_noise(a, o, channel=ch)
+                elif fn == "DC":
+                    c.apply_dc(o, channel=ch)
+                elif fn == "ARB":
+                    c.apply_arbitrary(f, a, o, channel=ch)
+                log_msg(f"ch{ch} apply {fn}  f={f}  A={a}  off={o}")
+            except Exception as e:
+                log_msg(f"ch{ch} apply FAIL: {type(e).__name__}: {e}")
 
-        try:
-            if kind == "Sine":
-                wf = WaveformGenerator.sine(freq, name=name)
-            elif kind == "Square":
-                wf = WaveformGenerator.square(freq, 50.0, name=name)
-            elif kind == "Triangle":
-                wf = WaveformGenerator.ramp(freq, symmetry=50.0, name=name)
-            elif kind == "Pulse":
-                wf = WaveformGenerator.pulse(freq, 50.0, 0.01, 0.01, name=name)
-            elif kind == "Gaussian":
-                wf = WaveformGenerator.gaussian(freq, 0.15, name=name)
-            elif kind == "Sinc":
-                wf = WaveformGenerator.sinc(freq, 4, name=name)
-            elif kind == "Exponential decay":
-                wf = WaveformGenerator.exponential(freq, 0.2, decay=True, name=name)
-            elif kind == "Frequency comb":
-                tones = [float(t.strip()) for t in self._arb_comb.text().split(",")
-                         if t.strip()]
-                if not tones:
-                    raise ValueError("Provide ≥1 comb frequency")
-                wf = WaveformGenerator.frequency_comb(
-                    tones, monte_carlo_iter=500, name=name)
-                freq = wf.frequency
-            else:
-                raise ValueError(f"Unknown generator: {kind}")
-        except Exception as e:
-            self._log_msg(f"Generator error: {e}")
-            return
+        async def apply():    await _in_thread(_do_apply)
 
-        try:
-            self._ctrl.load_arbitrary(
-                wf.name, wf.data, channel=ch, binary=True, select=True,
-                sample_rate=wf.sample_rate if wf.sample_rate > 0 else None)
-            self._log_msg(
-                f"Uploaded {wf.num_points}-pt {kind!r} as {wf.name!r} on CH{ch} "
-                f"(f0={wf.frequency:.4g} Hz, sr={wf.sample_rate/1e6:.3g} MSa/s).")
-            self._plot_arb(wf.data, f"{kind}: {wf.name}")
-        except Exception as e:
-            self._log_msg(f"Upload error: {e}")
+        async def out_on():
+            c = get_ctrl()
+            if c is None: log_msg(f"ch{ch} output_on: not connected"); return
+            try:
+                await _in_thread(c.output_on, ch)
+                out_pill.content = (f'<span class="pill ok" '
+                                     f'style="margin-top:.4rem; display:inline-block">'
+                                     f'ch{ch} output: on</span>')
+                log_msg(f"ch{ch} output ON")
+            except Exception as e:
+                log_msg(f"ch{ch} output_on FAIL: {type(e).__name__}: {e}")
 
-    def _on_arb_file(self):
-        if self._ctrl is None: return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load arbitrary waveform", "",
-            "Waveform (*.csv *.npy *.txt);;All files (*)"
-        )
-        if not path: return
-        try:
-            if path.lower().endswith(".npy"):
-                samples = np.load(path)
-            else:
-                samples = np.loadtxt(path, delimiter=",")
-            samples = np.asarray(samples).flatten()
-            n = samples.size
-            if n < ARB_MIN_POINTS or n > ARB_MAX_POINTS:
-                raise ValueError(
-                    f"Length must be {ARB_MIN_POINTS}..{ARB_MAX_POINTS}, got {n}")
-            name = self._arb_name.text().strip() or "ARB1"
-            ch   = int(self._arb_ch.currentText())
-            self._ctrl.load_arbitrary(name, samples, channel=ch,
-                                      binary=True, select=True)
-            self._log_msg(
-                f"Loaded {n}-pt waveform from {path!r} as {name!r} on CH{ch}.")
-            self._plot_arb(samples, f"From file: {name}")
-        except Exception as e:
-            self._log_msg(f"File load error: {e}")
+        async def out_off():
+            c = get_ctrl()
+            if c is None: log_msg(f"ch{ch} output_off: not connected"); return
+            try:
+                await _in_thread(c.output_off, ch)
+                out_pill.content = (f'<span class="pill mut" '
+                                     f'style="margin-top:.4rem; display:inline-block">'
+                                     f'ch{ch} output: off</span>')
+                log_msg(f"ch{ch} output OFF")
+            except Exception as e:
+                log_msg(f"ch{ch} output_off FAIL: {type(e).__name__}: {e}")
 
-    def _on_arb_play(self):
-        if self._ctrl is None: return
-        ch   = int(self._arb_ch.currentText())
-        freq = self._arb_freq.value()
-        try:
-            self._ctrl.apply_arbitrary(freq, 0.1, 0.0, channel=ch)
-            self._log_msg(f"CH{ch}: APPLy:ARB at {freq:g} Hz.")
-        except Exception as e:
-            self._log_msg(f"Apply ARB error: {e}")
+        with ui.row().classes("gap-2 mt-1"):
+            ui.button(f"apply ch{ch}", on_click=apply).props("color=primary")
+            ui.button("output on",     on_click=out_on).props("color=primary")
+            ui.button("output off",    on_click=out_off).props("color=negative")
 
-    def _plot_arb(self, samples: np.ndarray, title: str):
-        if not HAS_MPL:
-            return
-        self._arb_ax.clear()
-        self._arb_ax.plot(samples, lw=1)
-        self._arb_ax.set_xlabel("Sample"); self._arb_ax.set_ylabel("Amplitude")
-        self._arb_ax.set_title(title)
-        self._arb_ax.grid(True, alpha=0.3)
-        self._arb_fig.tight_layout()
-        self._arb_canvas.draw()
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+# ===========================================================================
+# build_page
+# ===========================================================================
 
-    def _log_msg(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self._log.append(f"[{ts}] {msg}")
+def build_page(get_controller: Optional[Callable[[], Optional[KS33500BController]]] = None,
+               *, show_connection: Optional[bool] = None) -> None:
+    """Render the KS33500B control panel into the current container."""
+    if show_connection is None:
+        show_connection = (get_controller is None)
 
-    def closeEvent(self, event):
-        if self._ctrl:
-            try: self._ctrl.disconnect()
-            except Exception: pass
-        super().closeEvent(event)
+    _own: dict = {"ctrl": None, "arb_samples": None}
+    if get_controller is None:
+        def get_controller():
+            return _own["ctrl"]
+
+    log = ui.log(max_lines=120).classes("h-32 w-full")
+    def log_msg(s: str): log.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+
+    with ui.tabs().classes("w-full") as tabs:
+        t_conn  = ui.tab("connection") if show_connection else None
+        t_ch1   = ui.tab("ch1")
+        t_ch2   = ui.tab("ch2")
+        t_burst = ui.tab("burst")
+        t_sweep = ui.tab("sweep")
+        t_arb   = ui.tab("arbitrary")
+
+    initial = t_conn if t_conn is not None else t_ch1
+    with ui.tab_panels(tabs, value=initial).classes("w-full"):
+
+        # ----- Connection (standalone only) -----
+        if t_conn is not None:
+            with ui.tab_panel(t_conn):
+                with ui.card().classes("ks-card"):
+                    ui.html("<h2>instrument connection</h2>")
+                    visa_in = ui.input(label="VISA / device path",
+                                        value=DEFAULT_VISA).classes("w-96 num")
+                    mode_in = ui.select(["simulation", "hardware"],
+                                         value="simulation",
+                                         label="mode").classes("w-40")
+                    conn_pill = ui.html('<span class="pill mut">disconnected</span>')
+
+                    def set_pill(text: str, cls: str):
+                        conn_pill.content = f'<span class="pill {cls}">{text}</span>'
+
+                    async def do_connect():
+                        c = KS33500BController(visa=visa_in.value.strip(),
+                                                mode=mode_in.value)
+                        set_pill("connecting…", "warn")
+                        try:
+                            await _in_thread(c.connect)
+                            _own["ctrl"] = c
+                            set_pill(f"OK — {c.identify()[:60]}", "ok")
+                            log_msg(f"connected: {c.identify()}")
+                        except Exception as e:
+                            set_pill(f"FAIL: {type(e).__name__}", "bad")
+                            log_msg(f"connect FAIL: {type(e).__name__}: {e}")
+
+                    async def do_disconnect():
+                        c = _own["ctrl"]
+                        if c is None: return
+                        try: await _in_thread(c.disconnect)
+                        except Exception as e: log_msg(f"disconnect warn: {e}")
+                        _own["ctrl"] = None
+                        set_pill("disconnected", "mut")
+                        log_msg("disconnected")
+
+                    with ui.row().classes("mt-1 gap-2"):
+                        ui.button("connect",    on_click=do_connect).props("color=primary")
+                        ui.button("disconnect", on_click=do_disconnect).props("color=negative flat")
+
+        # ----- ch1 / ch2 -----
+        with ui.tab_panel(t_ch1):
+            _channel_card(1, get_controller, log_msg)
+        with ui.tab_panel(t_ch2):
+            _channel_card(2, get_controller, log_msg)
+
+        # ----- Burst -----
+        with ui.tab_panel(t_burst):
+            with ui.card().classes("ks-card"):
+                ui.html("<h2>burst mode</h2>")
+                b_ch   = ui.select(["1", "2"], value="1", label="channel").classes("w-24")
+                b_n    = ui.number(label="N cycles", value=1, step=1).classes("w-32 num")
+                b_mode = ui.select(["TRIG", "GAT"], value="TRIG",
+                                    label="mode").classes("w-32")
+                b_ph   = ui.number(label="initial phase (deg)", value=0.0,
+                                    step=1.0).classes("w-40 num")
+                b_trig = ui.select(["IMM", "EXT", "TIM", "BUS"], value="IMM",
+                                    label="trigger source").classes("w-32")
+
+                async def burst_apply():
+                    c = get_controller()
+                    if c is None: log_msg("burst: not connected"); return
+                    try:
+                        # controller.enable_burst(ncycles, mode, phase_deg,
+                        #                         trigger, channel)
+                        await _in_thread(
+                            c.enable_burst,
+                            int(b_n.value), str(b_mode.value),
+                            float(b_ph.value), str(b_trig.value),
+                            int(b_ch.value),
+                        )
+                        log_msg(f"burst enabled ch{b_ch.value} n={b_n.value} "
+                                 f"mode={b_mode.value} trig={b_trig.value}")
+                    except Exception as e:
+                        log_msg(f"burst_apply FAIL: {type(e).__name__}: {e}")
+
+                async def burst_off():
+                    c = get_controller()
+                    if c is None: log_msg("burst: not connected"); return
+                    try:
+                        await _in_thread(c.disable_burst, int(b_ch.value))
+                        log_msg(f"burst disabled ch{b_ch.value}")
+                    except Exception as e:
+                        log_msg(f"burst_off FAIL: {type(e).__name__}: {e}")
+
+                async def burst_trg():
+                    c = get_controller()
+                    if c is None: log_msg("burst: not connected"); return
+                    try:
+                        await _in_thread(c.trigger, int(b_ch.value))
+                        log_msg(f"*TRG sent (ch{b_ch.value})")
+                    except Exception as e:
+                        log_msg(f"trigger FAIL: {type(e).__name__}: {e}")
+
+                with ui.row().classes("gap-2 mt-1"):
+                    ui.button("enable burst",     on_click=burst_apply).props("color=primary")
+                    ui.button("disable burst",    on_click=burst_off).props("color=negative")
+                    ui.button("trigger now (*TRG)", on_click=burst_trg)
+
+        # ----- Sweep -----
+        with ui.tab_panel(t_sweep):
+            with ui.card().classes("ks-card"):
+                ui.html("<h2>frequency sweep</h2>")
+                sw_ch    = ui.select(["1", "2"], value="1", label="channel").classes("w-24")
+                sw_start = ui.number(label="start (Hz)", value=100.0,
+                                      step=1.0, format="%.3f").classes("w-40 num")
+                sw_stop  = ui.number(label="stop (Hz)",  value=10_000.0,
+                                      step=1.0, format="%.3f").classes("w-40 num")
+                sw_time  = ui.number(label="sweep time (s)", value=1.0,
+                                      step=0.1, format="%.3f").classes("w-32 num")
+                sw_spc   = ui.select(["LIN", "LOG"], value="LIN",
+                                      label="spacing").classes("w-32")
+                sw_trig  = ui.select(["IMM", "EXT", "BUS"], value="IMM",
+                                      label="trigger source").classes("w-32")
+                sw_ret   = ui.number(label="return time (s)", value=0.0,
+                                      step=0.1, format="%.3f").classes("w-32 num")
+                sw_hold_a= ui.number(label="hold @ start (s)", value=0.0,
+                                      step=0.1, format="%.3f").classes("w-32 num")
+                sw_hold_b= ui.number(label="hold @ stop (s)",  value=0.0,
+                                      step=0.1, format="%.3f").classes("w-32 num")
+
+                async def sweep_apply():
+                    c = get_controller()
+                    if c is None: log_msg("sweep: not connected"); return
+                    try:
+                        # controller.enable_sweep(start_hz, stop_hz, time_s,
+                        #     spacing, return_time, hold_start, hold_stop,
+                        #     trigger, channel)
+                        await _in_thread(
+                            c.enable_sweep,
+                            float(sw_start.value), float(sw_stop.value),
+                            float(sw_time.value),  str(sw_spc.value),
+                            float(sw_ret.value),
+                            float(sw_hold_a.value), float(sw_hold_b.value),
+                            str(sw_trig.value),    int(sw_ch.value),
+                        )
+                        log_msg(f"sweep ch{sw_ch.value} {sw_start.value}→{sw_stop.value} Hz "
+                                 f"{sw_spc.value} in {sw_time.value} s")
+                    except Exception as e:
+                        log_msg(f"sweep_apply FAIL: {type(e).__name__}: {e}")
+
+                async def sweep_off():
+                    c = get_controller()
+                    if c is None: log_msg("sweep: not connected"); return
+                    try:
+                        await _in_thread(c.disable_sweep, int(sw_ch.value))
+                        log_msg(f"sweep disabled ch{sw_ch.value}")
+                    except Exception as e:
+                        log_msg(f"sweep_off FAIL: {type(e).__name__}: {e}")
+
+                with ui.row().classes("gap-2 mt-1"):
+                    ui.button("enable sweep",  on_click=sweep_apply).props("color=primary")
+                    ui.button("disable sweep", on_click=sweep_off).props("color=negative")
+
+        # ----- Arbitrary -----
+        with ui.tab_panel(t_arb):
+            with ui.card().classes("ks-card w-full"):
+                ui.html("<h2>generate &amp; download an arbitrary waveform</h2>")
+                arb_test = ui.select(
+                    ["Sine cubed", "Triangle", "Gaussian pulse",
+                     "Exp rise", "Exp fall"],
+                    value="Sine cubed", label="generator",
+                ).classes("w-40")
+                arb_npts = ui.number(label="samples", value=1024,
+                                      step=64, min=8, max=65536).classes("w-32 num")
+                arb_name = ui.input(label="name (on instrument)",
+                                     value="ETSARB").classes("w-32")
+                arb_ch   = ui.select(["1", "2"], value="1",
+                                      label="channel").classes("w-24")
+
+                arb_plot = ui.matplotlib(figsize=(8, 2.4)).classes("w-full")
+                arb_ax   = arb_plot.figure.add_subplot(111)
+                _style_dark(arb_plot.figure, arb_ax)
+                arb_plot.figure.tight_layout()
+
+                def _gen():
+                    n = max(8, int(arb_npts.value))
+                    t = np.linspace(0.0, 1.0, n)
+                    name = str(arb_test.value)
+                    if name == "Sine cubed":
+                        return np.sin(2 * np.pi * t) ** 3
+                    elif name == "Triangle":
+                        return 2 * np.abs(2 * (t - np.floor(t + 0.5))) - 1
+                    elif name == "Gaussian pulse":
+                        return np.exp(-((t - 0.5) / 0.07) ** 2)
+                    elif name == "Exp rise":
+                        return 1 - np.exp(-5 * t)
+                    else:  # "Exp fall"
+                        return np.exp(-5 * t)
+
+                def generate_and_preview():
+                    samples = _gen()
+                    _own["arb_samples"] = samples
+                    arb_ax.clear()
+                    _style_dark(arb_plot.figure, arb_ax)
+                    arb_ax.plot(samples, lw=1.2, color="#58a6ff")
+                    arb_ax.set_xlabel("sample", color="#8a93a6", fontsize=9)
+                    arb_ax.set_ylabel("amplitude (normalised)",
+                                       color="#8a93a6", fontsize=9)
+                    arb_plot.figure.tight_layout()
+                    arb_plot.update()
+                    log_msg(f"generated {len(samples)} samples ({arb_test.value})")
+
+                async def download():
+                    samples = _own["arb_samples"]
+                    if samples is None:
+                        log_msg("no samples — click 'generate + preview' first"); return
+                    c = get_controller()
+                    if c is None: log_msg("arb: not connected"); return
+                    try:
+                        await _in_thread(
+                            c.load_arbitrary,
+                            str(arb_name.value).strip() or "ETSARB",
+                            samples, int(arb_ch.value),
+                        )
+                        log_msg(f"downloaded {len(samples)} samples '{arb_name.value}' "
+                                 f"to ch{arb_ch.value}")
+                    except Exception as e:
+                        log_msg(f"load_arbitrary FAIL: {type(e).__name__}: {e}")
+
+                with ui.row().classes("gap-2 mt-1"):
+                    ui.button("generate + preview",   on_click=generate_and_preview).props("color=primary")
+                    ui.button("download to instrument", on_click=download).props("color=primary")
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Standalone entry — `python -m ks33500b.gui`
 # ---------------------------------------------------------------------------
 
 def main():
-    app = QApplication(sys.argv)
-    win = KS33500BWindow()
-    win.show()
-    sys.exit(app.exec_())
+    import argparse
+    p = argparse.ArgumentParser(description="Keysight 33500B web GUI")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8772)
+    args = p.parse_args()
+
+    @ui.page("/")
+    def index():
+        ui.add_head_html(f"<style>{_CSS}</style>")
+        ui.dark_mode().enable()
+        with ui.element("header").style(
+            "display:flex;align-items:center;gap:.8rem;"
+            "padding:.55rem 1rem;background:var(--panel);"
+            "border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5"
+        ):
+            ui.html("<h1 style='font-size:1.05rem;font-weight:600;margin:0'>"
+                    "33500B · waveform generator</h1>")
+        build_page()
+
+    ui.run(host=args.host, port=args.port, reload=False,
+           title="33500B WFG", show=False)
 
 
-if __name__ == "__main__":
+if __name__ in {"__main__", "__mp_main__"}:
     main()
