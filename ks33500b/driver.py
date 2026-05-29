@@ -284,7 +284,10 @@ class KS33500BDriver:
         # APPLy takes at most freq,amplitude,offset — it has no phase
         # argument. Passing a 4th value triggers -108 "Parameter not
         # allowed" and the instrument discards the whole command, so the
-        # amplitude never updates. Phase is set separately via :PHASe.
+        # amplitude never updates. Phase is set separately via :PHASe,
+        # and only for the functions that have a phase reference (sine,
+        # square, ramp, arb per the 33500 user's guide) — pulse/noise/DC
+        # have none and would reject :PHASe.
         if fn in ("NOIS", "DC"):
             cmd = (f":SOURce{channel}:APPLy:{scpi} "
                    f"DEFault,{amplitude:.6f},{offset:.6f}")
@@ -292,16 +295,17 @@ class KS33500BDriver:
             cmd = (f":SOURce{channel}:APPLy:{scpi} "
                    f"{frequency:.6f},{amplitude:.6f},{offset:.6f}")
 
+        has_phase = fn in ("SIN", "SQU", "RAMP", "ARB")
         if self._mode == "hardware":
             self._inst.write(cmd)
-            if fn not in ("NOIS", "DC"):
+            if has_phase:
                 self._inst.write(f":SOURce{channel}:PHASe {phase:.4f}")
         st = self._sim_state[channel]
         st["function"]  = fn
         st["frequency"] = float(frequency)
         st["amplitude"] = float(amplitude)
         st["offset"]    = float(offset)
-        if fn not in ("NOIS", "DC"):
+        if has_phase:
             st["phase"] = float(phase)
         if fn == "SQU":
             st["duty_cycle"] = 50.0   # APPLy resets duty to 50%
