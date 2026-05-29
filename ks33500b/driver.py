@@ -281,24 +281,27 @@ class KS33500BDriver:
         fn = _norm_func(function)
         scpi = _FUNC_SCPI_LONG[fn]
 
+        # APPLy takes at most freq,amplitude,offset — it has no phase
+        # argument. Passing a 4th value triggers -108 "Parameter not
+        # allowed" and the instrument discards the whole command, so the
+        # amplitude never updates. Phase is set separately via :PHASe.
         if fn in ("NOIS", "DC"):
             cmd = (f":SOURce{channel}:APPLy:{scpi} "
                    f"DEFault,{amplitude:.6f},{offset:.6f}")
-        elif fn == "ARB":
-            cmd = (f":SOURce{channel}:APPLy:{scpi} "
-                   f"{frequency:.6f},{amplitude:.6f},{offset:.6f}")
         else:
             cmd = (f":SOURce{channel}:APPLy:{scpi} "
-                   f"{frequency:.6f},{amplitude:.6f},{offset:.6f},{phase:.6f}")
+                   f"{frequency:.6f},{amplitude:.6f},{offset:.6f}")
 
         if self._mode == "hardware":
             self._inst.write(cmd)
+            if fn not in ("NOIS", "DC"):
+                self._inst.write(f":SOURce{channel}:PHASe {phase:.4f}")
         st = self._sim_state[channel]
         st["function"]  = fn
         st["frequency"] = float(frequency)
         st["amplitude"] = float(amplitude)
         st["offset"]    = float(offset)
-        if fn not in ("NOIS", "DC", "ARB"):
+        if fn not in ("NOIS", "DC"):
             st["phase"] = float(phase)
         if fn == "SQU":
             st["duty_cycle"] = 50.0   # APPLy resets duty to 50%
